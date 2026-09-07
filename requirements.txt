@@ -6,3 +6,4 @@ numpy
 Pillow
 pytesseract
 scikit-image
+reportlab

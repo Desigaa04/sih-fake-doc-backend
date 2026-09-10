@@ -68,11 +68,51 @@ MAX_PLAUSIBLE_AGE = 120
 # as the default example; extend/adjust per country if needed)
 PASSPORT_NUMBER_PATTERN = re.compile(r"^[A-Z]\d{7}$")
 
-DATE_FORMATS_TO_TRY = ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%Y%m%d"]
+DATE_FORMATS_TO_TRY = ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y"]
+# Note: "%Y%m%d" was deliberately removed - Python's strptime matches it
+# against unseparated digit strings of ANY length (including 6-digit MRZ
+# dates) using ambiguous greedy digit-grouping, which silently produces
+# wrong dates (e.g. "000815" was misparsed as year=8, not year=2000).
+# The dedicated MRZ YYMMDD handling below is the correct path for
+# unseparated 6-digit dates.
 
 
-def _try_parse_date(date_str: str) -> date | None:
-    """Attempts to parse a date string using several common formats."""
+def _resolve_two_digit_year(yy: int, bias: str) -> int:
+    """
+    Resolves a 2-digit MRZ year to a full 4-digit year. MRZ dates don't
+    encode century, so we have to infer it - and birth dates vs expiry
+    dates need OPPOSITE assumptions:
+      - Birth dates should resolve to the most recent year that is not
+        in the future (people aren't born in the future).
+      - Expiry dates should resolve to a year at or after the current
+        year (a passport that "expired 94 years ago" almost always
+        actually means 20xx, not 19xx).
+    """
+    current_year = datetime.now().year
+    current_century_base = (current_year // 100) * 100
+    candidate_current = current_century_base + yy
+    candidate_prev = candidate_current - 100
+    candidate_next = candidate_current + 100
+
+    if bias == "past":
+        candidates = [c for c in (candidate_current, candidate_prev) if c <= current_year]
+        return max(candidates) if candidates else candidate_prev
+    else:  # bias == "future"
+        # Prefer the current-century candidate unless it's implausibly
+        # far in the past for an expiry date.
+        if candidate_current >= current_year - 1:
+            return candidate_current
+        return candidate_next
+
+
+def _try_parse_date(date_str: str, mrz_year_bias: str = "past") -> date | None:
+    """
+    Attempts to parse a date string using several common formats.
+
+    mrz_year_bias only affects raw 6-digit MRZ-style dates (YYMMDD),
+    which don't carry century information - pass "past" for birth dates
+    and "future" for expiry dates so the 2-digit year resolves sensibly.
+    """
     date_str = date_str.strip()
 
     for fmt in DATE_FORMATS_TO_TRY:
@@ -85,12 +125,9 @@ def _try_parse_date(date_str: str) -> date | None:
     # inference since MRZ only stores 2-digit years
     if re.match(r"^\d{6}$", date_str):
         yy, mm, dd = int(date_str[0:2]), int(date_str[2:4]), int(date_str[4:6])
-        # Heuristic: birth dates assume 1900s/2000s based on plausibility;
-        # a real system would use document-specific context (issue date)
-        current_yy = datetime.now().year % 100
-        century = 2000 if yy <= current_yy else 1900
+        year = _resolve_two_digit_year(yy, bias=mrz_year_bias)
         try:
-            return date(century + yy, mm, dd)
+            return date(year, mm, dd)
         except ValueError:
             return None
 
@@ -102,7 +139,7 @@ def _check_expiry_date(fields: dict, flags: list[ValidationFlag]) -> None:
     if not expiry_str:
         return
 
-    expiry_date = _try_parse_date(expiry_str)
+    expiry_date = _try_parse_date(expiry_str, mrz_year_bias="future")
     if expiry_date is None:
         flags.append(ValidationFlag(
             code="UNPARSEABLE_EXPIRY_DATE",
@@ -193,12 +230,12 @@ def _check_field_consistency(fields: dict, flags: list[ValidationFlag]) -> None:
     between the two is a strong tampering signal, since forging both the
     printed text AND the MRZ consistently is much harder to pull off.
     """
-    checks = [
+    # Text fields: compared as cleaned strings (letters/digits only)
+    text_checks = [
         ("passport_number", "mrz_passport_number", "passport number"),
-        ("date_of_expiry", "mrz_date_of_expiry", "expiry date"),
     ]
 
-    for printed_key, mrz_key, label in checks:
+    for printed_key, mrz_key, label in text_checks:
         printed_val = fields.get(printed_key)
         mrz_val = fields.get(mrz_key)
         if not printed_val or not mrz_val:
@@ -214,6 +251,38 @@ def _check_field_consistency(fields: dict, flags: list[ValidationFlag]) -> None:
                             f"match the {label} found in the machine-readable zone "
                             f"('{mrz_val}'). A genuine document's MRZ and printed fields "
                             f"should always agree - this is a strong tampering signal.",
+                severity="high",
+            ))
+
+    # Date fields: printed dates (e.g. DD/MM/YYYY) and MRZ dates (raw
+    # YYMMDD) use different formats, so they must be parsed into actual
+    # date objects before comparing - comparing the raw strings directly
+    # would falsely flag every genuine document.
+    date_checks = [
+        ("date_of_expiry", "mrz_date_of_expiry", "expiry date", "future"),
+        ("date_of_birth", "mrz_date_of_birth", "date of birth", "past"),
+    ]
+
+    for printed_key, mrz_key, label, bias in date_checks:
+        printed_val = fields.get(printed_key)
+        mrz_val = fields.get(mrz_key)
+        if not printed_val or not mrz_val:
+            continue
+
+        printed_date = _try_parse_date(printed_val, mrz_year_bias=bias)
+        mrz_date = _try_parse_date(mrz_val, mrz_year_bias=bias)
+
+        if printed_date is None or mrz_date is None:
+            continue  # unparseable dates are already flagged separately
+
+        if printed_date != mrz_date:
+            flags.append(ValidationFlag(
+                code="MRZ_PRINTED_MISMATCH",
+                description=f"The {label} in the printed text ('{printed_val}' = "
+                            f"{printed_date.isoformat()}) does not match the {label} found "
+                            f"in the machine-readable zone ('{mrz_val}' = "
+                            f"{mrz_date.isoformat()}). A genuine document's MRZ and printed "
+                            f"fields should always agree - this is a strong tampering signal.",
                 severity="high",
             ))
 

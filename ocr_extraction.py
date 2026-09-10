@@ -27,12 +27,17 @@ Usage:
 """
 
 from __future__ import annotations
+from mrz_validation import detect_mrz_format, parse_mrv_a, validate_mrv_a, calculate_check_digit
 
 import os
 import re
 from dataclasses import dataclass, field
 
 import pytesseract
+# Tesseract path is configured via the TESSERACT_CMD environment variable
+# in main.py (set once, works on any machine/deployment) - NOT hardcoded
+# here, since a hardcoded Windows path would crash on Linux deployments
+# like Render.
 from PIL import Image
 
 
@@ -72,6 +77,14 @@ FIELD_PATTERNS = {
     "gender": re.compile(r"(?:Sex|Gender)\s*[:\-]?\s*(M|F|Male|Female)", re.IGNORECASE),
     "visa_number": re.compile(r"Visa\s*(?:No\.?|Number)\s*[:\-]?\s*([A-Z0-9]{6,12})", re.IGNORECASE),
     "visa_type": re.compile(r"Visa Type\s*[:\-]?\s*([A-Za-z0-9\-]+)", re.IGNORECASE),
+    "entry_validation": re.compile(
+        r"(?:Entries|Entry Validation|No\.? of Entries|Number of Entries)\s*[:\-]?\s*(Single|Multiple|\d+)",
+        re.IGNORECASE,
+    ),
+    "stay_duration": re.compile(
+        r"(?:Duration of Stay|Length of Stay|Stay Duration|Period of Stay)\s*[:\-]?\s*(\d+\s*(?:Days?|Months?|Years?))",
+        re.IGNORECASE,
+    ),
     "id_number": re.compile(r"(?:ID No\.?|ID Number|License No\.?)\s*[:\-]?\s*([A-Z0-9\-]{6,15})", re.IGNORECASE),
 }
 
@@ -95,52 +108,149 @@ def _extract_printed_fields(text: str) -> dict:
 
 def _find_mrz_lines(text: str) -> list[str]:
     """
-    Looks for lines that resemble MRZ format (long uppercase strings with
-    '<' padding characters) among the OCR'd text lines.
+    Finds two consecutive lines that may form a visa/passport MRZ.
+    Handles common OCR errors in the MRZ prefix.
     """
-    candidate_lines = []
+
+    lines = []
+
     for line in text.split("\n"):
         cleaned = line.strip().replace(" ", "")
-        if len(cleaned) >= 30 and "<" in cleaned:
-            candidate_lines.append(cleaned)
-    return candidate_lines
 
+        if len(cleaned) >= 30:
+            lines.append(cleaned)
 
+    for i, line in enumerate(lines):
+
+        # Visa MRZ prefix
+        if line.startswith("V<") or line.startswith("VN"):
+
+            if i + 1 < len(lines):
+                return [line, lines[i + 1]]
+
+        # Passport MRZ prefix
+        if line.startswith("P<"):
+
+            if i + 1 < len(lines):
+                return [line, lines[i + 1]]
+
+    return []
 def _parse_mrz(mrz_lines: list[str]) -> dict:
     """
-    Parses a standard TD3 (passport) MRZ if 2 valid-looking lines are
-    found. This format is standardized (ICAO 9303), so field positions
-    are fixed:
-      Line 1: P<COUNTRY<SURNAME<<GIVEN<NAMES<<<<<<<<<<<<<<<<<<<<<<<
-      Line 2: PASSPORTNO<CHECK COUNTRY BIRTHDATE<CHECK SEX EXPIRY<CHECK...
-    OCR quality on MRZ text is often imperfect, so this is best-effort
-    parsing, not guaranteed - flagged as such in warnings if fields look
-    malformed.
+    Parses passport TD3 or visa MRV-A/MRV-B MRZ.
     """
+
     parsed = {}
+
     if len(mrz_lines) < 2:
         return parsed
 
-    line1, line2 = mrz_lines[0], mrz_lines[1]
+    line1 = mrz_lines[0].replace(" ", "")
+    line2 = mrz_lines[1].replace(" ", "")
 
     try:
-        if line1.startswith("P<"):
-            name_part = line1[5:].rstrip("<")
-            surname, _, given_names = name_part.partition("<<")
-            parsed["mrz_surname"] = surname.replace("<", " ").strip()
-            parsed["mrz_given_names"] = given_names.replace("<", " ").strip()
 
-        if len(line2) >= 28:
-            parsed["mrz_passport_number"] = line2[0:9].replace("<", "").strip()
-            parsed["mrz_nationality"] = line2[10:13].strip()
-            parsed["mrz_date_of_birth"] = line2[13:19].strip()  # YYMMDD
-            parsed["mrz_sex"] = line2[20:21].strip()
-            parsed["mrz_date_of_expiry"] = line2[21:27].strip()  # YYMMDD
+        # Detect MRZ format
+        mrz_format = detect_mrz_format(line1, line2)
+
+        parsed["mrz_format"] = mrz_format
+
+        # -------------------------------------------------
+        # VISA MRZ
+        # -------------------------------------------------
+
+        if mrz_format == "MRV-A_VISA":
+
+            visa_data = parse_mrv_a(line2)
+
+            if visa_data:
+                parsed["mrz_document_number"] = visa_data["document_number"]
+                parsed["mrz_nationality"] = visa_data["nationality"]
+                parsed["mrz_date_of_birth"] = visa_data["date_of_birth"]
+                parsed["mrz_sex"] = visa_data["sex"]
+                parsed["mrz_date_of_expiry"] = visa_data["valid_until"]
+
+                # Validate MRZ checksums
+                validation = validate_mrv_a(line2)
+                parsed["mrz_validation"] = validation
+
+                # Surfaced in the exact shape document_validation.py's
+                # _check_mrz_checksum() reads, so the MRZ_CHECKSUM_FAILED
+                # flag actually fires when a checksum genuinely fails.
+                parsed["mrz_checksum_valid"] = validation["status"] == "MRZ_VALID"
+                parsed["mrz_checksum_details"] = {
+                    k: v for k, v in validation.items() if k != "status"
+                }
+
+            return parsed
+
+        # -------------------------------------------------
+        # PASSPORT MRZ
+        # -------------------------------------------------
+
+        if mrz_format == "PASSPORT":
+
+            if line1.startswith("P<"):
+                name_part = line1[5:].rstrip("<")
+                surname, _, given_names = name_part.partition("<<")
+
+                parsed["mrz_surname"] = surname.replace(
+                    "<", " "
+                ).strip()
+
+                parsed["mrz_given_names"] = given_names.replace(
+                    "<", " "
+                ).strip()
+
+            if len(line2) >= 28:
+                passport_number_field = line2[0:9]
+                dob_field = line2[13:19]
+                expiry_field = line2[21:27]
+
+                parsed["mrz_passport_number"] = (
+                    passport_number_field.replace("<", "").strip()
+                )
+
+                parsed["mrz_nationality"] = line2[10:13].strip()
+
+                parsed["mrz_date_of_birth"] = dob_field.strip()
+
+                parsed["mrz_sex"] = line2[20:21].strip()
+
+                parsed["mrz_date_of_expiry"] = expiry_field.strip()
+
+                # Validate passport MRZ checksums (same ICAO 9303 formula
+                # used for visas above) - this was previously missing for
+                # passports specifically.
+                if len(line2) >= 28:
+                    checks = {}
+                    all_valid = True
+
+                    for check_name, (data, check_digit_char) in {
+                        "passport_number": (passport_number_field, line2[9]),
+                        "date_of_birth": (dob_field, line2[19]),
+                        "date_of_expiry": (expiry_field, line2[27]),
+                    }.items():
+                        computed = calculate_check_digit(data)
+                        valid = check_digit_char.isdigit() and computed == int(check_digit_char)
+                        checks[check_name] = {
+                            "value": data,
+                            "given_check_digit": check_digit_char,
+                            "calculated_check_digit": str(computed),
+                            "valid": valid,
+                        }
+                        if not valid:
+                            all_valid = False
+
+                    parsed["mrz_checksum_valid"] = all_valid
+                    parsed["mrz_checksum_details"] = checks
+
+            return parsed
+
     except IndexError:
-        pass  # malformed/incomplete MRZ - just return what we got
+        pass
 
     return parsed
-
 
 def _guess_document_type(text: str, mrz_found: bool) -> str:
     lower = text.lower()

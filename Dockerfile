@@ -2,11 +2,14 @@
 FROM python:3.11-slim
 
 # Install Tesseract OCR (the system program, same as you installed on
-# your own laptop) plus a couple of graphics libraries OpenCV needs to
-# run on a bare Linux server (these come pre-installed on Windows/Mac,
-# but not on a minimal cloud server).
+# your own laptop) plus its Hindi language data (needed since SIH26188's
+# actual scope covers Indian documents, which commonly mix Hindi and
+# English), plus a couple of graphics libraries OpenCV needs to run on a
+# bare Linux server (these come pre-installed on Windows/Mac, but not on
+# a minimal cloud server).
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
+    tesseract-ocr-hin \
     libgl1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*

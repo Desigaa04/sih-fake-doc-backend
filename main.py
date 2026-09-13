@@ -46,7 +46,6 @@ from face_verification import analyze_face_verification
 from metadata_analysis import analyze_metadata
 from ocr_extraction import extract_document_fields
 from photo_replacement import analyze_photo_replacement
-from preprocessing import enhance_image_for_ocr
 from report_generator import build_pdf_report
 from stamp_forgery import analyze_stamp_forgery
 from text_manipulation import analyze_text_manipulation
@@ -84,8 +83,7 @@ def _run_pipeline(doc_path: str, tmp_dir: str, selfie_path: Optional[str] = None
     """
     module_results = {}
 
-    ocr_ready_path = enhance_image_for_ocr(doc_path, tmp_dir)
-    extraction = extract_document_fields(ocr_ready_path)
+    extraction = extract_document_fields(doc_path)
     module_results["ocr_extraction"] = extraction
 
     validation = validate_document_fields(

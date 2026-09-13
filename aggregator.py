@@ -164,6 +164,7 @@ def aggregate_results(module_results: dict) -> dict:
                 "extracted_fields": ocr_info.get("extracted_fields"),
                 "mrz_detected": ocr_info.get("mrz_detected"),
                 "warnings": ocr_info.get("warnings"),
+                "raw_text": ocr_info.get("raw_text"),
             },
             "module_2_document_validation": {
                 "evaluated": doc_validation_result is not None,

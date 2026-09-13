@@ -496,7 +496,15 @@ UPLOAD_PAGE_HTML = r"""
         } else {
             fieldKeys.forEach(key => {
                 const row = document.createElement('tr');
-                row.innerHTML = `<td>${key.replace(/_/g, ' ')}</td><td>${fields[key]}</td>`;
+                const value = fields[key];
+                // Nested objects (like mrz_validation, mrz_checksum_details)
+                // need to be formatted as readable JSON, not just inserted
+                // directly - that would show "[object Object]" instead of
+                // the actual content.
+                const displayValue = (value !== null && typeof value === 'object')
+                    ? `<pre style="white-space:pre-wrap;margin:0;font-size:12px;">${JSON.stringify(value, null, 2)}</pre>`
+                    : value;
+                row.innerHTML = `<td>${key.replace(/_/g, ' ')}</td><td>${displayValue}</td>`;
                 fieldsTable.appendChild(row);
             });
         }

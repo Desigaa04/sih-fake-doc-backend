@@ -80,13 +80,17 @@ DATE_FORMATS_TO_TRY = ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y"]
 def _resolve_two_digit_year(yy: int, bias: str) -> int:
     """
     Resolves a 2-digit MRZ year to a full 4-digit year. MRZ dates don't
-    encode century, so we have to infer it - and birth dates vs expiry
-    dates need OPPOSITE assumptions:
+    encode century, so we have to infer it:
       - Birth dates should resolve to the most recent year that is not
         in the future (people aren't born in the future).
-      - Expiry dates should resolve to a year at or after the current
-        year (a passport that "expired 94 years ago" almost always
-        actually means 20xx, not 19xx).
+      - Expiry dates use the century interpretation CLOSEST to today,
+        rather than forcing the result to be >= today. An already-
+        expired document is a completely normal, valid state (that's
+        what DOCUMENT_EXPIRED is for) - forcing expiry dates into the
+        future previously turned a legitimately-expired "04" (2004)
+        into an absurd "2104", 78 years in the future. Picking the
+        closest century still correctly resolves genuine ambiguity
+        (e.g. yy=94 -> 1994, not 2094, since 1994 is closer to today).
     """
     current_year = datetime.now().year
     current_century_base = (current_year // 100) * 100
@@ -97,12 +101,9 @@ def _resolve_two_digit_year(yy: int, bias: str) -> int:
     if bias == "past":
         candidates = [c for c in (candidate_current, candidate_prev) if c <= current_year]
         return max(candidates) if candidates else candidate_prev
-    else:  # bias == "future"
-        # Prefer the current-century candidate unless it's implausibly
-        # far in the past for an expiry date.
-        if candidate_current >= current_year - 1:
-            return candidate_current
-        return candidate_next
+    else:  # bias == "future" (really just means "no forced-past bias")
+        candidates = [candidate_prev, candidate_current, candidate_next]
+        return min(candidates, key=lambda c: abs(c - current_year))
 
 
 def _try_parse_date(date_str: str, mrz_year_bias: str = "past") -> date | None:
@@ -141,6 +142,13 @@ def _check_expiry_date(fields: dict, flags: list[ValidationFlag]) -> None:
 
     expiry_date = _try_parse_date(expiry_str, mrz_year_bias="future")
     if expiry_date is None:
+        # OCR misreads printed digits on genuine documents too (e.g.
+        # "26/86/2017" for 26/06/2017). If the MRZ carries a parseable
+        # expiry date, trust the MRZ (it is checksum-protected) and skip
+        # the printed-text OCR noise rather than flagging the document.
+        mrz_expiry = fields.get("mrz_date_of_expiry")
+        if mrz_expiry and _try_parse_date(mrz_expiry, mrz_year_bias="future") is not None:
+            return
         flags.append(ValidationFlag(
             code="UNPARSEABLE_EXPIRY_DATE",
             description=f"Could not parse the expiry date value '{expiry_str}' into a "
@@ -175,6 +183,11 @@ def _check_date_of_birth(fields: dict, flags: list[ValidationFlag]) -> None:
 
     dob = _try_parse_date(dob_str)
     if dob is None:
+        # Same MRZ-trust rule as the expiry check above: a parseable
+        # checksum-protected MRZ date of birth outranks noisy printed OCR.
+        mrz_dob = fields.get("mrz_date_of_birth")
+        if mrz_dob and _try_parse_date(mrz_dob, mrz_year_bias="past") is not None:
+            return
         flags.append(ValidationFlag(
             code="UNPARSEABLE_DOB",
             description=f"Could not parse the date of birth value '{dob_str}' into a "
@@ -287,6 +300,45 @@ def _check_field_consistency(fields: dict, flags: list[ValidationFlag]) -> None:
             ))
 
 
+def _check_mrz_checksum(fields: dict, flags: list[ValidationFlag]) -> None:
+    """
+    Verifies the ICAO 9303 check digits embedded in the MRZ. The checksum
+    work itself is done upstream in ocr_extraction.py's _parse_mrz()
+    (passports, incl. the final composite digit) and
+    mrz_validation.validate_mrv_a() (visas); this check turns a failed
+    result into a formal high-severity flag.
+
+    A checksum mismatch is one of the strongest forgery signals possible:
+    the check digits are physically printed inside the MRZ itself, so any
+    tampered passport number, date of birth or expiry date almost never
+    re-validates unless the forger ALSO recomputed every MRZ check digit
+    consistently.
+    """
+    # Absent (no MRZ found / unparseable) or True -> nothing to flag.
+    # Absence is NOT flagged here: unparseable-MRZ quality issues are
+    # already surfaced by ocr_extraction.py's warnings.
+    if fields.get("mrz_checksum_valid") is not False:
+        return
+
+    details = fields.get("mrz_checksum_details") or {}
+    failed = sorted(
+        name.replace("_", " ")
+        for name, check in details.items()
+        if isinstance(check, dict) and not check.get("valid", True)
+    )
+    failed_label = ", ".join(failed) if failed else "unknown field(s)"
+
+    flags.append(ValidationFlag(
+        code="MRZ_CHECKSUM_FAILED",
+        description=f"ICAO 9303 check digit validation FAILED in the machine-readable "
+                    f"zone for: {failed_label}. Check digits are printed inside the MRZ "
+                    f"itself, so a mismatch means the MRZ data was altered or fabricated "
+                    f"without recomputing the checksums - one of the strongest forgery "
+                    f"signals possible.",
+        severity="high",
+    ))
+
+
 def _check_missing_critical_fields(fields: dict, doc_type: str, flags: list[ValidationFlag]) -> None:
     critical_by_type = {
         "passport": ["name", "date_of_birth", "passport_number"],
@@ -295,7 +347,16 @@ def _check_missing_critical_fields(fields: dict, doc_type: str, flags: list[Vali
         "driving_license": ["name", "id_number"],
     }
     expected = critical_by_type.get(doc_type, [])
-    missing = [f for f in expected if f not in fields and f"mrz_{f}" not in fields]
+    def _present(field_name: str) -> bool:
+        if field_name in fields:
+            return True
+        aliases = ["mrz_" + field_name]
+        if field_name == "visa_number":
+            # Visa MRZs carry the document number as mrz_document_number
+            aliases.append("mrz_document_number")
+        return any(a in fields for a in aliases)
+
+    missing = [f for f in expected if not _present(f)]
 
     if missing and len(missing) == len(expected) and expected:
         flags.append(ValidationFlag(
@@ -319,6 +380,7 @@ def validate_document_fields(extracted_fields: dict, document_type: str) -> dict
     _check_date_of_birth(extracted_fields, flags)
     _check_passport_number_format(extracted_fields, document_type, flags)
     _check_field_consistency(extracted_fields, flags)
+    _check_mrz_checksum(extracted_fields, flags)
     _check_missing_critical_fields(extracted_fields, document_type, flags)
 
     risk_score = min(100, sum(SEVERITY_WEIGHTS[f.severity] for f in flags))

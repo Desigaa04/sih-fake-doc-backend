@@ -93,7 +93,12 @@ def _run_ocr(image: Image.Image) -> dict:
     bounding boxes (needed for the font/spacing/baseline checks), not just
     plain text.
     """
-    return pytesseract.image_to_data(image, output_type=Output.DICT)
+    # eng+hin: same reasoning as ocr_extraction.py's _run_ocr() - Indian
+    # documents commonly mix Hindi (Devanagari) and English, and
+    # English-only OCR here would produce garbled word boxes, causing
+    # false INCONSISTENT_FONT_SIZE / BASELINE_MISALIGNMENT flags on
+    # genuinely normal bilingual documents.
+    return pytesseract.image_to_data(image, lang="eng+hin", output_type=Output.DICT)
 
 
 def _extract_plain_text(ocr_data: dict) -> str:
@@ -125,30 +130,46 @@ def _check_date_validity(text: str, flags: list[TextFlag]) -> None:
 
 def _check_font_height_consistency(ocr_data: dict, flags: list[TextFlag]) -> None:
     """
-    Genuine printed documents use a consistent font size throughout each
-    field/line. Computes the coefficient of variation of word bounding-box
-    heights - a high value suggests mixed font sizes, which can happen
-    when new text is pasted in to replace an original field (fonts rarely
-    match perfectly, even when a forger tries).
+    Genuine printed lines use a consistent font size WITHIN that line -
+    but different lines/fields on a document (e.g. a big title vs
+    smaller body text vs tiny MRZ text) naturally differ in size by
+    design, which is normal and should NOT be flagged. This checks each
+    line separately (same grouping as _check_baseline_consistency
+    above), rather than computing one variation score across the whole
+    document, which previously mixed titles/labels/data together and
+    fired on nearly every real document layout.
     """
-    heights = [
-        h for h, txt in zip(ocr_data.get("height", []), ocr_data.get("text", []))
-        if txt.strip() and h > 0
-    ]
-    if len(heights) < 4:
-        return  # not enough text detected to make a reliable judgment
+    lines: dict[tuple, list[int]] = {}
+    n = len(ocr_data.get("text", []))
+    for i in range(n):
+        txt = ocr_data["text"][i].strip()
+        h = ocr_data["height"][i]
+        if not txt or h <= 0:
+            continue
+        key = (ocr_data["block_num"][i], ocr_data["par_num"][i], ocr_data["line_num"][i])
+        lines.setdefault(key, []).append(h)
 
-    mean_h = statistics.mean(heights)
-    std_h = statistics.stdev(heights)
-    cv = std_h / mean_h if mean_h > 0 else 0
+    offending_lines = 0
+    lines_checked = 0
+    for key, heights in lines.items():
+        if len(heights) < 3:
+            continue  # need a few words on the SAME line to judge consistency
+        lines_checked += 1
+        mean_h = statistics.mean(heights)
+        std_h = statistics.stdev(heights)
+        cv = std_h / mean_h if mean_h > 0 else 0
+        if cv > FONT_HEIGHT_CV_THRESHOLD:
+            offending_lines += 1
 
-    if cv > FONT_HEIGHT_CV_THRESHOLD:
+    if lines_checked > 0 and offending_lines > 0:
         flags.append(TextFlag(
             code="INCONSISTENT_FONT_SIZE",
-            description=f"Detected significant variation in text height across the document "
-                        f"(variation score={cv:.2f}). Genuine printed documents usually have "
-                        f"consistent font sizing; high variation can indicate a field was "
-                        f"replaced with text from a different source.",
+            description=f"Found {offending_lines} line(s) (out of {lines_checked} checked) "
+                        f"where words on the SAME line have inconsistent heights. Genuine "
+                        f"printed lines keep a consistent font size within that line; this can "
+                        f"indicate a word was pasted in from a different source. (Normal "
+                        f"document-wide differences, like a large title vs smaller body text, "
+                        f"are not flagged.)",
             severity="medium",
         ))
 

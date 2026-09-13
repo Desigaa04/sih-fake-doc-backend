@@ -24,8 +24,14 @@ def detect_mrz_format(line1, line2):
     if line1.startswith("P<"):
         return "PASSPORT"
 
-    # Visa MRZ
-    if line1.startswith("V<") or line1.startswith("VN"):
+    # Visa MRZ. ICAO 9303 says visa MRZ line 1 starts with "V" followed
+    # by a type-designer character (often "<", i.e. V<), but real issuing
+    # states print real characters there: India e-visas use VT/VJ, and
+    # VJ* / VN* etc. all appear on genuine visas worldwide. Accept any
+    # V-prefixed line whose third character is also MRZ-legal (A-Z, 0-9,
+    # or "<") rather than enumerating codes - a strict V</VN list silently
+    # rejects genuine Indian visas.
+    if line1.startswith("V") and len(line1) >= 3 and (line1[2].isalnum() or line1[2] == "<"):
 
         if len(line1) == 44 and len(line2) == 44:
             return "MRV-A_VISA"
@@ -76,12 +82,27 @@ def validate_mrv_a(line2):
 
     calculated = calculate_check_digit(document_number)
 
-    results["document_number"] = {
-        "value": document_number,
-        "given_check_digit": document_check_digit,
-        "calculated_check_digit": str(calculated),
-        "valid": document_check_digit == str(calculated)
-    }
+    # A "<" in the check-digit position is LEGAL per ICAO 9303 when the
+    # underlying field is padded with fillers (e.g. 8-char document number
+    # in the 9-char field: "DCHC4C<<"+... has no meaningful check digit to
+    # verify). Treat it as "not applicable" rather than a failure - the
+    # old code compared "<" to a computed number and false-flagged every
+    # genuine Indian visa.
+    if document_check_digit == "<":
+        results["document_number"] = {
+            "value": document_number,
+            "given_check_digit": document_check_digit,
+            "calculated_check_digit": str(calculated),
+            "valid": True,
+            "note": "check digit absent (filler-padded field) - not verifiable",
+        }
+    else:
+        results["document_number"] = {
+            "value": document_number,
+            "given_check_digit": document_check_digit,
+            "calculated_check_digit": str(calculated),
+            "valid": document_check_digit == str(calculated)
+        }
 
     # Date of birth
     dob = line2[13:19]

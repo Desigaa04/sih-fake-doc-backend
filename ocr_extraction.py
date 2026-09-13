@@ -28,6 +28,7 @@ Usage:
 
 from __future__ import annotations
 from mrz_validation import detect_mrz_format, parse_mrv_a, validate_mrv_a, calculate_check_digit
+from preprocessing import enhance_image_for_ocr, enhance_image_for_ocr_thresholded
 
 import os
 import re
@@ -63,7 +64,10 @@ class ExtractionResult:
 
 # --- Field patterns for standard printed fields ---
 FIELD_PATTERNS = {
-    "name": re.compile(r"(?:Name|Full Name)\s*[:\-]?\s*([A-Z][A-Za-z\s.]+?)(?=\s*\n|\s*$)", re.IGNORECASE),
+    "name": re.compile(
+        r"(?<!Issuing Post )(?:Name|Full Name)\s*[:\-]?\s*([A-Z][A-Za-z\s.]+?)(?=\s*\n|\s*$)",
+        re.IGNORECASE,
+    ),
     "date_of_birth": re.compile(
         r"(?:Date of Birth|DOB|Birth)\s*[:\-]?\s*(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4})",
         re.IGNORECASE,
@@ -76,9 +80,13 @@ FIELD_PATTERNS = {
     "nationality": re.compile(r"Nationality\s*[:\-]?\s*([A-Za-z\s]+?)(?=\s*\n|\s*$)", re.IGNORECASE),
     "gender": re.compile(r"(?:Sex|Gender)\s*[:\-]?\s*(M|F|Male|Female)", re.IGNORECASE),
     "visa_number": re.compile(r"Visa\s*(?:No\.?|Number)\s*[:\-]?\s*([A-Z0-9]{6,12})", re.IGNORECASE),
-    "visa_type": re.compile(r"Visa Type\s*[:\-]?\s*([A-Za-z0-9\-]+)", re.IGNORECASE),
+    "visa_type": re.compile(
+        r"Visa Type\s*(?:/\s*Class)?\s*[:\-]?\s*([A-Za-z0-9/]+(?:\s+[A-Za-z0-9/]+)?)",
+        re.IGNORECASE,
+    ),
     "entry_validation": re.compile(
-        r"(?:Entries|Entry Validation|No\.? of Entries|Number of Entries)\s*[:\-]?\s*(Single|Multiple|\d+)",
+        r"(?:Entries|Entry Validation|No\.? of Entries|Number of Entries)\s*[:\-]?\s*"
+        r"(Single|Multiple|\bS\b|\bM\b|\d+)",
         re.IGNORECASE,
     ),
     "stay_duration": re.compile(
@@ -94,7 +102,13 @@ MRZ_LINE_PATTERN = re.compile(r"^[A-Z0-9<]{30,44}$")
 
 
 def _run_ocr(image: Image.Image) -> str:
-    return pytesseract.image_to_string(image)
+    # eng+hin: reads both English and Hindi (Devanagari script) in the
+    # same pass - needed since Indian documents (SIH26188's actual
+    # scope, under SSB/border checkpoints) commonly mix both scripts on
+    # one document. English-only OCR misreads Devanagari characters as
+    # garbled English, and that corruption can bleed into and break
+    # nearby genuine English text too.
+    return pytesseract.image_to_string(image, lang="eng+hin")
 
 
 def _extract_printed_fields(text: str) -> dict:
@@ -102,7 +116,16 @@ def _extract_printed_fields(text: str) -> dict:
     for field_name, pattern in FIELD_PATTERNS.items():
         match = pattern.search(text)
         if match:
-            fields[field_name] = match.group(1).strip()
+            value = match.group(1).strip()
+            if field_name == "entry_validation":
+                # Real visas often abbreviate to a single letter (US visas
+                # use "M"/"S") rather than spelling out "Multiple"/"Single" -
+                # normalize so the output is human-readable either way.
+                if value.upper() == "M":
+                    value = "Multiple (M)"
+                elif value.upper() == "S":
+                    value = "Single (S)"
+            fields[field_name] = value
     return fields
 
 
@@ -242,6 +265,31 @@ def _parse_mrz(mrz_lines: list[str]) -> dict:
                         if not valid:
                             all_valid = False
 
+                    # Final composite check digit (ICAO 9303 TD3, line 2,
+                    # position 44): the 7-3-1 weighted sum over the
+                    # CONCATENATION of the passport number, date of birth
+                    # and date of expiry fields - each including its own
+                    # check digit (i.e. positions 1-10, 14-20, 22-43).
+                    # Deliberately only computed on a full 44-char line: on
+                    # a truncated OCR line the splice points would be
+                    # wrong and the result meaningless.
+                    if len(line2) == 44:
+                        composite_data = line2[0:10] + line2[13:20] + line2[21:43]
+                        composite_given = line2[43]
+                        composite_computed = calculate_check_digit(composite_data)
+                        composite_valid = (
+                            composite_given.isdigit()
+                            and composite_computed == int(composite_given)
+                        )
+                        checks["composite"] = {
+                            "value": composite_data,
+                            "given_check_digit": composite_given,
+                            "calculated_check_digit": str(composite_computed),
+                            "valid": composite_valid,
+                        }
+                        if not composite_valid:
+                            all_valid = False
+
                     parsed["mrz_checksum_valid"] = all_valid
                     parsed["mrz_checksum_details"] = checks
 
@@ -252,10 +300,24 @@ def _parse_mrz(mrz_lines: list[str]) -> dict:
 
     return parsed
 
-def _guess_document_type(text: str, mrz_found: bool) -> str:
+def _guess_document_type(text: str, mrz_format_detected: str | None) -> str:
+    """
+    Guesses which of the 5 SIH document types this is. Checks the ACTUAL
+    detected MRZ format (PASSPORT vs MRV-A_VISA / MRV-B_VISA) rather than
+    just whether any MRZ was found - previously, any MRZ presence
+    defaulted to "passport" even when it was clearly a visa MRZ, which
+    also threw off document_validation.py's field-checking downstream
+    (it expects different fields for each document type). "visa" keyword
+    is also checked before the generic "passport" keyword, since visa
+    documents commonly mention "passport" in their own printed text.
+    """
     lower = text.lower()
-    if mrz_found or "passport" in lower:
+
+    if mrz_format_detected == "PASSPORT":
         return "passport"
+    if mrz_format_detected in ("MRV-A_VISA", "MRV-B_VISA", "VISA_UNKNOWN_FORMAT"):
+        return "visa"
+
     if "visa" in lower:
         return "visa"
     if "driving licence" in lower or "driving license" in lower:
@@ -264,33 +326,60 @@ def _guess_document_type(text: str, mrz_found: bool) -> str:
         return "permit"
     if "identity card" in lower or "national id" in lower:
         return "national_id"
+    if "passport" in lower:
+        return "passport"
     return "unknown"
 
 
 def extract_document_fields(file_path: str) -> dict:
     """
-    Main entry point. Runs OCR on the document image and extracts
-    structured identity fields, using both printed-field pattern matching
-    and MRZ parsing (for passports) where applicable.
+    Main entry point. Runs OCR TWICE on the document image, using two
+    different preprocessing strategies, and merges the best result from
+    each - this was found necessary through real testing: Otsu
+    thresholding (see preprocessing.py) genuinely improves reading
+    larger printed fields on watermarked/textured-background documents,
+    but makes the small, dense MRZ zone WORSE, not better. Rather than
+    picking one strategy and accepting a tradeoff, we run both and use
+    each one where it's actually better:
+      - MRZ parsing: uses the NON-thresholded (sharpened only) text,
+        since thresholding was tested to introduce more corruption there.
+      - Printed field extraction: tries the thresholded text first (it's
+        the stronger version for this), then fills in any still-missing
+        fields from the non-thresholded text as a fallback - some fields
+        may extract from one version but not the other, so merging both
+        catches more overall than committing to a single strategy.
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"No such file: {file_path}")
 
     file_name = os.path.basename(file_path)
     warnings: list[str] = []
+    output_dir = os.path.dirname(file_path)
 
-    with Image.open(file_path) as image:
-        raw_text = _run_ocr(image)
+    sharp_path = enhance_image_for_ocr(file_path, output_dir)
+    with Image.open(sharp_path) as image:
+        raw_text_sharp = _run_ocr(image)
 
-    if not raw_text.strip():
+    thresh_path = enhance_image_for_ocr_thresholded(file_path, output_dir)
+    with Image.open(thresh_path) as image:
+        raw_text_thresh = _run_ocr(image)
+
+    if not raw_text_sharp.strip() and not raw_text_thresh.strip():
         warnings.append(
             "No text could be extracted from this image. Check image quality, "
             "orientation, and lighting."
         )
 
-    printed_fields = _extract_printed_fields(raw_text)
-    mrz_lines = _find_mrz_lines(raw_text)
+    # MRZ: use the non-thresholded text - tested to be more reliable for
+    # this specific small, dense monospace zone. Fall back to the
+    # thresholded text only if the sharpened version found nothing.
+    mrz_lines = _find_mrz_lines(raw_text_sharp)
     mrz_fields = _parse_mrz(mrz_lines)
+    if not mrz_fields:
+        mrz_lines_fallback = _find_mrz_lines(raw_text_thresh)
+        mrz_fields = _parse_mrz(mrz_lines_fallback)
+        if mrz_fields:
+            mrz_lines = mrz_lines_fallback
 
     if mrz_lines and not mrz_fields:
         warnings.append(
@@ -298,8 +387,18 @@ def extract_document_fields(file_path: str) -> dict:
             "OCR quality on this region may be too low."
         )
 
+    # Printed fields: merge results from both versions - thresholded
+    # text takes priority (tested as the stronger version for printed
+    # fields), non-thresholded text fills in anything still missing.
+    printed_fields_thresh = _extract_printed_fields(raw_text_thresh)
+    printed_fields_sharp = _extract_printed_fields(raw_text_sharp)
+    printed_fields = {**printed_fields_sharp, **printed_fields_thresh}
+
     all_fields = {**printed_fields, **mrz_fields}
-    doc_type = _guess_document_type(raw_text, bool(mrz_fields))
+    # Use whichever raw text is longer/richer for document-type keyword
+    # guessing and as the canonical raw_text shown in the API response.
+    raw_text = raw_text_thresh if len(raw_text_thresh) >= len(raw_text_sharp) else raw_text_sharp
+    doc_type = _guess_document_type(raw_text_sharp + " " + raw_text_thresh, mrz_fields.get("mrz_format"))
 
     if not all_fields:
         warnings.append(
